@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     env::args,
     fs::OpenOptions,
     os::linux::fs::MetadataExt,
@@ -47,6 +46,7 @@ mod btrfs {
     // };
 
     // le on disk
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     #[repr(C)]
     pub struct IoctlSearchHeader {
         transid: u64,
@@ -81,6 +81,7 @@ mod btrfs {
     //     num_bytes: u64,
     // };
     // le on disk
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[repr(packed)]
     pub struct FileExtentItem {
         pub generation: u64,
@@ -284,7 +285,6 @@ mod btrfs {
     }
 
     impl IoctlSearchKey {
-        #[inline]
         fn new(st_ino: u64) -> Self {
             Self {
                 tree_id: 0,
@@ -316,7 +316,6 @@ mod btrfs {
     }
 
     impl Sv2Args {
-        #[inline]
         pub fn new() -> Self {
             Self {
                 key: IoctlSearchKey::new(0),
@@ -343,34 +342,31 @@ mod btrfs {
         sv2_arg: &'arg mut Sv2Args,
         fd: F,
         pos: usize,
-        offset: u64,
         nrest_item: u32,
-        finish: bool,
+        last: bool,
     }
     impl<'arg, F: AsFd> Iterator for Sv2ItemIter<'arg, F> {
         type Item = IoctlSearchItem;
 
         fn next(&mut self) -> Option<Self::Item> {
-            if self.nrest_item == 0 {
-                if self.finish {
-                    return None;
-                } else {
-                    self.call_ioctl().unwrap();
-                }
+            if self.need_ioctl() {
+                self.call_ioctl().unwrap();
+            }
+            if self.finish() {
+                return None;
             }
             let ret = unsafe { IoctlSearchItem::from_le_raw(&self.sv2_arg.buf[self.pos..]) };
             self.pos += size_of::<IoctlSearchHeader>() + ret.header.len as usize;
             self.nrest_item -= 1;
             if self.nrest_item == 0 {
-                self.offset = ret.header.offset;
+                self.sv2_arg.key.min_offset = ret.header.offset + 1;
             }
             Some(ret)
         }
     }
-    // impl<F: AsFd> FusedIterator for Sv2ItemIter<'_, F> {}
+    impl<F: AsFd> FusedIterator for Sv2ItemIter<'_, F> {}
     impl<'arg, F: AsFd> Sv2ItemIter<'arg, F> {
         fn call_ioctl(&mut self) -> Result<(), Errno> {
-            self.sv2_arg.key.min_offset = self.offset;
             unsafe {
                 let ctl = Updater::<'_, ReadWriteOpcode<BTRFS_IOCTL_MAGIC, 17, Sv2Args>, _>::new(
                     self.sv2_arg,
@@ -378,9 +374,15 @@ mod btrfs {
                 ioctl(&self.fd, ctl)?;
             }
             self.nrest_item = self.sv2_arg.key.nr_items;
-            self.finish = self.nrest_item <= 512;
+            self.last = self.nrest_item <= 512;
             self.pos = 0;
             Ok(())
+        }
+        fn need_ioctl(&self) -> bool {
+            self.nrest_item == 0 && !self.last
+        }
+        fn finish(&self) -> bool {
+            self.nrest_item == 0 && self.last
         }
         pub fn new(sv2_arg: &'arg mut Sv2Args, fd: F) -> Result<Self, Errno> {
             sv2_arg.key.nr_items = u32::MAX;
@@ -390,9 +392,8 @@ mod btrfs {
                 sv2_arg,
                 fd,
                 pos: 0,
-                offset: 0,
                 nrest_item: 0,
-                finish: false,
+                last: false,
             };
             ret.call_ioctl()?;
             Ok(ret)
@@ -414,7 +415,7 @@ struct Compsize {
     nref: u64,
     prealloc: ExtentStat,
     stat: [ExtentStat; 4],
-    extents: HashSet<u64>,
+    extents: nohash::IntSet<u64>,
 }
 
 #[derive(Debug)]
@@ -443,10 +444,10 @@ impl Compsize {
                 uncomp: 0,
                 refd: 0,
             },
-            extents: HashSet::new(),
+            extents: nohash::IntSet::default(),
         }
     }
-    fn add_file(&mut self, file_stat: &FileStat) {
+    fn add_extent(&mut self, file_stat: &FileStat) {
         // TODO: refactor file stat: seperate inline and others
         let (key, comp, stat) = file_stat;
         match key.r#type() {
@@ -497,7 +498,7 @@ fn do_file(ws: &mut Compsize, fd: impl AsFd, ino: u64, filename: Display) {
                 Ok(o) => o,
                 Err(e) => die!("{}: {}", filename, e),
             })
-            .for_each(|item| ws.add_file(&item)),
+            .for_each(|item| ws.add_extent(&item)),
         Err(e) => {
             if e == Errno::NOTTY {
                 die!("{}: Not btrfs (or SEARCH_V2 unsupported).", filename)
@@ -510,7 +511,6 @@ fn do_file(ws: &mut Compsize, fd: impl AsFd, ino: u64, filename: Display) {
 
 fn search_path(ws: &mut Compsize, path: &mut PathBuf, dev: Dev) {
     let st = path.symlink_metadata().unwrap();
-    // let st = path.metadata().unwrap();
     if st.is_dir() {
         path.read_dir().unwrap().for_each(|entry| {
             let entry = entry.unwrap();
@@ -537,7 +537,6 @@ fn search_path(ws: &mut Compsize, path: &mut PathBuf, dev: Dev) {
     }
 }
 fn main() {
-    println!("Hello, world!");
     let mut ws = Compsize::new();
     for arg in args().skip(1) {
         let mut path = PathBuf::from(arg);
@@ -547,49 +546,3 @@ fn main() {
     let final_stat = ws.build_final();
     println!("{:#?}", final_stat);
 }
-
-// fn parse_file_extent_item(buf: &[u8], hlen: u32, ws: &mut WorkSpace, file_name: &str) {
-//     let extent_item = btrfs::FileExtentItem::from_bytes(buf);
-//     if extent_item.get_type() == btrfs::BTRFS_FILE_EXTENT_INLINE {
-//         do_inline(extent_item, hlen, ws);
-//         return;
-//     }
-//     if hlen != 53 {
-//         die!(
-//             "{}: Regular extent's header not 53 bytes ({}) long?!?",
-//             file_name,
-//             hlen,
-//         );
-//     }
-//     if extent_item.is_hole() {
-//         return;
-//     }
-//     let disk_bytenr = extent_item.get_disk_bytenr();
-//     if disk_bytenr.trailing_zeros() < 12 {
-//         die!("{}: Extent not 4K-aligned at {}?!?", file_name, disk_bytenr)
-//     }
-//     let disk_bytenr = disk_bytenr >> 12;
-//     let stat = if extent_item.get_type() == BTRFS_FILE_EXTENT_PREALLOC {
-//         &mut ws.prealloc
-//     } else {
-//         &mut ws.stat[extent_item.get_compression() as usize]
-//     };
-//     if ws.seen_extents.insert(disk_bytenr) {
-//         stat.disk += extent_item.get_disk_num_bytes() as u64;
-//         stat.uncomp += extent_item.get_ram_bytes() as u64;
-//         ws.nextents += 1;
-//     }
-//     stat.refd += extent_item.get_num_bytes() as u64;
-//     ws.nrefs += 1;
-// }
-
-// fn do_inline(extent_item: btrfs::FileExtentItem, hlen: u32, ws: &mut WorkSpace) {
-//     const INLINE_HEADER_SIZE: u32 = 21;
-//     let disk_num_bytes = hlen - INLINE_HEADER_SIZE;
-//     let ram_bytes = extent_item.get_ram_bytes() as u64;
-//     ws.ninline += 1;
-//     let stat = &mut ws.stat[extent_item.get_compression() as usize];
-//     stat.disk += disk_num_bytes as u64;
-//     stat.uncomp += ram_bytes;
-//     stat.refd += ram_bytes;
-// }

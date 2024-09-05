@@ -6,9 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+easy-parallel = "3.3.1"
 libc = "0.2.158"
 nohash = "0.2.0"
 rustix = { version = "0.38.34", features = ["fs", "system"] }
+smol = "2.0.1"
 
 [profile]
 [profile.dev.package."*"]

@@ -1,16 +1,15 @@
-use std::{
-    env::args,
-    fs::OpenOptions,
-    os::linux::fs::MetadataExt,
-    path::{Display, PathBuf},
-};
+use std::{env::args, os::linux::fs::MetadataExt as _, path::PathBuf, sync::Arc};
 
-use btrfs::{Compression, ExtentKey};
+use btrfs::Sv2Args;
+use easy_parallel::Parallel;
 use libc::{O_NOCTTY, O_NOFOLLOW, O_NONBLOCK};
-use rustix::{
-    fd::AsFd,
-    fs::{Dev, OpenOptionsExt},
-    io::Errno,
+use nohash::IntSet;
+use smol::{
+    block_on,
+    channel::{bounded, unbounded, Receiver, Sender},
+    fs::{read_dir, unix::OpenOptionsExt as _, DirEntry, OpenOptions},
+    stream::StreamExt as _,
+    Executor, Task,
 };
 
 macro_rules! die {
@@ -23,8 +22,9 @@ mod btrfs {
 
     use std::{fmt::Debug, iter::FusedIterator};
 
+    type File = smol::fs::File;
+
     use rustix::{
-        fd::AsFd,
         io::Errno,
         ioctl::{ioctl, ReadWriteOpcode, Updater},
     };
@@ -264,7 +264,7 @@ mod btrfs {
     // sv2_args->key.max_type = BTRFS_EXTENT_DATA_KEY;
     // sv2_args->key.nr_items = -1;
     // sv2_args->buf_size = sizeof(sv2_args->buf);
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[repr(C)]
     pub struct IoctlSearchKey {
         tree_id: u64,
@@ -307,7 +307,7 @@ mod btrfs {
     }
 
     // should be reused for different files
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq, Eq, Hash)]
     #[repr(C)]
     pub struct Sv2Args {
         key: IoctlSearchKey,
@@ -328,24 +328,20 @@ mod btrfs {
             self.key = IoctlSearchKey::new(ino);
         }
 
-        pub fn search_file<F: AsFd>(
-            &mut self,
-            fd: F,
-            ino: u64,
-        ) -> rustix::io::Result<Sv2ItemIter<F>> {
+        pub fn search_file(&mut self, fd: File, ino: u64) -> rustix::io::Result<Sv2ItemIter> {
             self.set_key(ino);
             Sv2ItemIter::new(self, fd)
         }
     }
     #[derive(Debug)]
-    pub struct Sv2ItemIter<'arg, F> {
+    pub struct Sv2ItemIter<'arg> {
         sv2_arg: &'arg mut Sv2Args,
-        fd: F,
+        fd: File,
         pos: usize,
         nrest_item: u32,
         last: bool,
     }
-    impl<'arg, F: AsFd> Iterator for Sv2ItemIter<'arg, F> {
+    impl<'arg> Iterator for Sv2ItemIter<'arg> {
         type Item = IoctlSearchItem;
 
         fn next(&mut self) -> Option<Self::Item> {
@@ -364,8 +360,8 @@ mod btrfs {
             Some(ret)
         }
     }
-    impl<F: AsFd> FusedIterator for Sv2ItemIter<'_, F> {}
-    impl<'arg, F: AsFd> Sv2ItemIter<'arg, F> {
+    impl FusedIterator for Sv2ItemIter<'_> {}
+    impl<'arg> Sv2ItemIter<'arg> {
         fn call_ioctl(&mut self) -> Result<(), Errno> {
             unsafe {
                 let ctl = Updater::<'_, ReadWriteOpcode<BTRFS_IOCTL_MAGIC, 17, Sv2Args>, _>::new(
@@ -384,7 +380,7 @@ mod btrfs {
         fn finish(&self) -> bool {
             self.nrest_item == 0 && self.last
         }
-        pub fn new(sv2_arg: &'arg mut Sv2Args, fd: F) -> Result<Self, Errno> {
+        pub fn new(sv2_arg: &'arg mut Sv2Args, fd: File) -> Result<Self, Errno> {
             sv2_arg.key.nr_items = u32::MAX;
             sv2_arg.key.min_offset = 0;
             // other fields not reset, maybe error?
@@ -401,24 +397,21 @@ mod btrfs {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 struct ExtentStat {
     pub disk: u64,
     pub uncomp: u64,
     pub refd: u64,
 }
-
-#[derive(Debug)]
-struct Compsize {
-    nfile: u64,
-    ninline: u64,
-    nref: u64,
-    prealloc: ExtentStat,
-    stat: [ExtentStat; 4],
-    extents: nohash::IntSet<u64>,
+impl ExtentStat {
+    fn merge(&mut self, rhs: Self) {
+        self.disk += rhs.disk;
+        self.uncomp += rhs.uncomp;
+        self.refd += rhs.refd;
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct CompsizeStat {
     nfile: u64,
     ninline: u64,
@@ -428,121 +421,213 @@ struct CompsizeStat {
     stat: [ExtentStat; 4],
 }
 
-impl Compsize {
-    fn new() -> Self {
+impl CompsizeStat {
+    fn merge(&mut self, rhs: Self) {
+        self.nfile += rhs.nfile;
+        self.ninline += rhs.ninline;
+        self.nref += rhs.nref;
+        self.nextent += rhs.nextent;
+        self.prealloc.merge(rhs.prealloc);
+        for (l, r) in self.stat.iter_mut().zip(rhs.stat) {
+            l.merge(r);
+        }
+    }
+}
+
+struct ExtentMap {
+    map: IntSet<u64>,
+    rx: Receiver<(u64, Sender<bool>)>,
+}
+
+impl ExtentMap {
+    fn new(recv: Receiver<(u64, Sender<bool>)>) -> Self {
         Self {
-            nfile: 0,
-            ninline: 0,
-            nref: 0,
-            stat: [ExtentStat {
-                disk: 0,
-                uncomp: 0,
-                refd: 0,
-            }; 4],
-            prealloc: ExtentStat {
-                disk: 0,
-                uncomp: 0,
-                refd: 0,
-            },
-            extents: nohash::IntSet::default(),
+            map: IntSet::default(),
+            rx: recv,
         }
     }
-    fn add_extent(&mut self, file_stat: &FileStat) {
-        // TODO: refactor file stat: seperate inline and others
-        let (key, comp, stat) = file_stat;
-        match key.r#type() {
-            btrfs::ExtentType::Inline => {
-                self.ninline += 1;
-                self.stat[comp.as_usize()].disk += stat.disk;
-                self.stat[comp.as_usize()].uncomp += stat.uncomp;
-                self.stat[comp.as_usize()].refd += stat.refd;
-            }
-            btrfs::ExtentType::Regular => {
-                self.nref += 1;
-                if self.extents.insert(key.key()) {
-                    self.stat[comp.as_usize()].disk += stat.disk;
-                    self.stat[comp.as_usize()].uncomp += stat.uncomp;
-                }
-                self.stat[comp.as_usize()].refd += stat.refd;
-            }
-            btrfs::ExtentType::Prealloc => {
-                self.nref += 1;
-                if self.extents.insert(key.key()) {
-                    self.prealloc.disk += stat.disk;
-                    self.prealloc.uncomp += stat.uncomp;
-                }
-                self.prealloc.refd += stat.refd;
-            }
+
+    async fn run(mut self) -> usize {
+        while let Ok((key, tx)) = self.rx.recv().await {
+            tx.send(self.map.insert(key)).await.unwrap();
+        }
+        self.map.len()
+    }
+}
+
+// blocking syscall: ioctl, should be run on multiple threads
+struct Worker {
+    rx: Receiver<(DirEntry, Sender<CompsizeStat>)>,
+    sv2_arg: Sv2Args,
+    extent_map: Sender<(u64, Sender<bool>)>,
+}
+impl Worker {
+    fn new(
+        recv: Receiver<(DirEntry, Sender<CompsizeStat>)>,
+        extent_map: Sender<(u64, Sender<bool>)>,
+    ) -> Self {
+        Self {
+            rx: recv,
+            sv2_arg: Sv2Args::new(),
+            extent_map,
         }
     }
-    fn build_final(self) -> CompsizeStat {
-        CompsizeStat {
-            nfile: self.nfile,
-            ninline: self.ninline,
-            nref: self.nref,
-            nextent: self.extents.len() as u64,
-            prealloc: self.prealloc,
-            stat: self.stat,
+
+    async fn run(mut self) {
+        while let Ok((entry, sender)) = self.rx.recv().await {
+            let mut ret = CompsizeStat::default();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(false)
+                .custom_flags(O_NOFOLLOW | O_NOCTTY | O_NONBLOCK)
+                .open(entry.path())
+                .await
+                .unwrap();
+            let ino = entry.metadata().await.unwrap().st_ino();
+
+            match self.sv2_arg.search_file(file, ino) {
+                Ok(iter) => {
+                    for (key, comp, stat) in iter.map(|item| item.parse().unwrap()) {
+                        match key.r#type() {
+                            btrfs::ExtentType::Inline => {
+                                ret.ninline += 1;
+                                ret.stat[comp.as_usize()].disk += stat.disk;
+                                ret.stat[comp.as_usize()].uncomp += stat.uncomp;
+                                ret.stat[comp.as_usize()].refd += stat.refd;
+                            }
+                            btrfs::ExtentType::Regular => {
+                                ret.nref += 1;
+                                let (tx, rx) = bounded(1);
+                                self.extent_map.send((key.key(), tx)).await.unwrap();
+                                if rx.recv().await.unwrap() {
+                                    ret.stat[comp.as_usize()].disk += stat.disk;
+                                    ret.stat[comp.as_usize()].uncomp += stat.uncomp;
+                                }
+                                ret.stat[comp.as_usize()].refd += stat.refd;
+                            }
+                            btrfs::ExtentType::Prealloc => {
+                                ret.nref += 1;
+                                let (tx, rx) = bounded(1);
+                                self.extent_map.send((key.key(), tx)).await.unwrap();
+                                if rx.recv().await.unwrap() {
+                                    ret.prealloc.disk += stat.disk;
+                                    ret.prealloc.uncomp += stat.uncomp;
+                                }
+                                ret.prealloc.refd += stat.refd;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    todo!()
+                }
+            }
+            ret.nfile += 1;
+            sender.send(ret).await.ok();
         }
     }
 }
 
-type FileStat = (ExtentKey, Compression, ExtentStat);
-
-fn do_file(ws: &mut Compsize, fd: impl AsFd, ino: u64, filename: Display) {
-    ws.nfile += 1;
-    let mut sv2_args = btrfs::Sv2Args::new();
-    match sv2_args.search_file(fd, ino) {
-        Ok(iter) => iter
-            .map(|item| match item.parse() {
-                Ok(o) => o,
-                Err(e) => die!("{}: {}", filename, e),
-            })
-            .for_each(|item| ws.add_extent(&item)),
-        Err(e) => {
-            if e == Errno::NOTTY {
-                die!("{}: Not btrfs (or SEARCH_V2 unsupported).", filename)
-            } else {
-                die!("{}: SEARCH_V2: {}", filename, e)
-            }
-        }
-    }
-}
-
-fn search_path(ws: &mut Compsize, path: &mut PathBuf, dev: Dev) {
-    let st = path.symlink_metadata().unwrap();
-    if st.is_dir() {
-        path.read_dir().unwrap().for_each(|entry| {
+fn do_direntry(
+    ex: Arc<Executor<'_>>,
+    dir: PathBuf,
+    extent_map: Sender<(u64, Sender<bool>)>,
+    workers: Sender<(DirEntry, Sender<CompsizeStat>)>,
+) -> Task<CompsizeStat> {
+    ex.clone().spawn(async move {
+        let mut dir = read_dir(dir).await.unwrap();
+        let mut handles = vec![];
+        while let Some(entry) = dir.next().await {
             let entry = entry.unwrap();
-            if entry.file_name() == "." || entry.file_name() == ".." {
-                return;
+            let file_type = entry.file_type().await.unwrap();
+            if file_type.is_dir() {
+                handles.push(do_direntry(
+                    ex.clone(),
+                    entry.path(),
+                    extent_map.clone(),
+                    workers.clone(),
+                ));
+            } else if file_type.is_file() {
+                let workers = workers.clone();
+                handles.push(do_file(&ex, entry, workers));
             }
-            path.push(entry.file_name());
-            search_path(ws, path, st.st_dev());
-            path.pop();
-        });
-    } else if st.is_file() {
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(false)
-            .custom_flags(O_NOFOLLOW | O_NOCTTY | O_NONBLOCK)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(e) => die!("open(\"{}\"): {}", path.display(), e),
-        };
-        do_file(ws, file, st.st_ino(), path.display());
-    } else {
-        // die!("{}: Not a file or directory.", path.display())
-    }
+        }
+        let mut ret = CompsizeStat::default();
+        for handle in handles {
+            ret.merge(handle.await);
+        }
+        ret
+    })
 }
+
+fn do_file(
+    ex: &Executor,
+    entry: DirEntry,
+    workers: Sender<(DirEntry, Sender<CompsizeStat>)>,
+) -> Task<CompsizeStat> {
+    ex.spawn(async move {
+        let (tx, rx) = bounded(1);
+        workers.send((entry, tx)).await.unwrap();
+        rx.recv().await.unwrap()
+    })
+}
+
 fn main() {
-    let mut ws = Compsize::new();
-    for arg in args().skip(1) {
-        let mut path = PathBuf::from(arg);
-        let dev = path.metadata().unwrap().st_dev();
-        search_path(&mut ws, &mut path, Dev::from(dev));
+    let (etx, erx) = bounded(16);
+    let (ftx, frx) = bounded(16);
+    let extent_map = ExtentMap::new(erx);
+    let ex = Arc::new(Executor::new());
+    let (signal, shutdown) = unbounded::<()>();
+    let mut tasks = vec![];
+    let etask = ex.spawn(async {
+        let ret = extent_map.run().await;
+        drop(signal);
+        ret
+    });
+    ex.spawn_many(
+        (0..12).map(|_| {
+            let worker = Worker::new(frx.clone(), etx.clone());
+            worker.run()
+        }),
+        &mut tasks,
+    );
+    let args: Vec<_> = args().skip(1).collect();
+    let mut handles = vec![];
+    for arg in args {
+        let path = PathBuf::from(arg);
+        let handle = if path.is_dir() {
+            do_direntry(ex.clone(), path, etx.clone(), ftx.clone())
+        } else {
+            // let ino = path.metadata().unwrap().st_ino();
+            // let file = block_on(
+            //     OpenOptions::new()
+            //         .read(true)
+            //         .write(false)
+            //         .custom_flags(O_NOFOLLOW | O_NOCTTY | O_NONBLOCK)
+            //         .open(path),
+            // )
+            // .unwrap();
+            // do_file(&ex, file, ino, ftx.clone())
+            todo!("single file")
+        };
+        handles.push(handle);
     }
-    let final_stat = ws.build_final();
+    drop(ftx);
+    drop(etx);
+    Parallel::new()
+        // Run executor threads.
+        .each(0..4, |_| {
+            block_on(ex.run(shutdown.recv())).ok();
+        })
+        // Run the main future on the current thread.
+        .run();
+    let final_stat = block_on(async {
+        let mut ret = CompsizeStat::default();
+        for handle in handles {
+            ret.merge(handle.await)
+        }
+        ret.nextent = etask.await as _;
+        ret
+    });
     println!("{:#?}", final_stat);
 }

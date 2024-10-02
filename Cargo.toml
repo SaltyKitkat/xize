@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-easy-parallel = "3.3.1"
-libc = "0.2.158"
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+dashmap = { version = "6.1.0", features = ["inline"] }
 nohash = "0.2.0"
-rustix = { version = "0.38.34", features = ["fs", "system"] }
-smol = "2.0.1"
+rustix = { version = "0.38.34" , features = ["fs"]}
+walkdir = "2.5.0"
 
 [profile]
 [profile.dev.package."*"]

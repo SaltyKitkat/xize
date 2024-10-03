@@ -164,7 +164,7 @@ impl IoctlSearchItem {
         let item = FileExtentItem::from_le_raw(&buf[size_of::<IoctlSearchHeader>()..]);
         Self { header, item }
     }
-    pub fn parse(&self) -> Result<(ExtentKey, Compression, ExtentStat), String> {
+    pub fn parse(&self) -> Result<Option<(ExtentKey, Compression, ExtentStat)>, String> {
         let hlen = self.header.len;
         let ram_bytes = self.item.ram_bytes;
         let comp_type = Compression::from_usize(self.item.compression);
@@ -173,7 +173,7 @@ impl IoctlSearchItem {
             const EXTENT_INLINE_HEADER_SIZE: usize = 21;
             let disk_num_bytes = hlen as u64 - EXTENT_INLINE_HEADER_SIZE as u64;
             // build result
-            return Ok((
+            return Ok(Some((
                 ExtentKey::new(extent_type, 0),
                 comp_type,
                 ExtentStat {
@@ -181,7 +181,7 @@ impl IoctlSearchItem {
                     uncomp: ram_bytes,
                     refd: ram_bytes,
                 },
-            ));
+            )));
         }
         if hlen != size_of::<FileExtentItem>() as u32 {
             let errmsg = format!("Regular extent's header not 53 bytes ({}) long?!?", hlen,);
@@ -190,15 +190,7 @@ impl IoctlSearchItem {
         let disk_bytenr = self.item.disk_bytenr;
         // is hole
         if disk_bytenr == 0 {
-            return Ok((
-                ExtentKey::new(extent_type, 0),
-                comp_type,
-                ExtentStat {
-                    disk: 0,
-                    uncomp: 0,
-                    refd: 0,
-                },
-            ));
+            return Ok(None);
         }
         // check 4k alignment
         if disk_bytenr & 0xfff != 0 {
@@ -208,7 +200,7 @@ impl IoctlSearchItem {
         let disk_bytenr = disk_bytenr >> 12;
         let disk_num_bytes = self.item.disk_num_bytes;
         let num_bytes = self.item.num_bytes;
-        Ok((
+        Ok(Some((
             ExtentKey::new(extent_type, disk_bytenr),
             comp_type,
             ExtentStat {
@@ -216,7 +208,7 @@ impl IoctlSearchItem {
                 uncomp: ram_bytes,
                 refd: num_bytes,
             },
-        ))
+        )))
     }
 }
 
@@ -319,7 +311,7 @@ pub struct Sv2ItemIter<'arg> {
     nrest_item: u32,
     last: bool,
 }
-impl<'arg> Iterator for Sv2ItemIter<'arg> {
+impl Iterator for Sv2ItemIter<'_> {
     type Item = IoctlSearchItem;
 
     fn next(&mut self) -> Option<Self::Item> {

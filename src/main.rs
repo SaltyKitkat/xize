@@ -1,9 +1,9 @@
 use std::{
     env::args,
-    fmt::Display,
+    fmt::{Display, Write},
     fs::OpenOptions,
     os::linux::fs::MetadataExt as _,
-    process,
+    process::{self, exit},
     sync::atomic::{AtomicBool, Ordering},
     thread::scope,
 };
@@ -13,7 +13,9 @@ use dashmap::DashSet;
 use nohash::BuildNoHashHasher;
 
 mod btrfs;
+mod scale;
 use btrfs::Sv2Args;
+use scale::Scale;
 use walkdir::{DirEntry, WalkDir};
 
 type ExtentMap = DashSet<u64, BuildNoHashHasher<u64>>;
@@ -32,6 +34,9 @@ impl ExtentStat {
     }
     fn is_empty(&self) -> bool {
         self.disk == 0 && self.uncomp == 0 && self.refd == 0
+    }
+    fn get_percent(&self) -> u64 {
+        self.disk * 100 / self.uncomp
     }
 }
 
@@ -56,38 +61,94 @@ impl CompsizeStat {
             l.merge(r);
         }
     }
-    fn display(&self, ty: DisplayType, scale: Scale) -> CompsizeStatDisplay<'_> {
-        CompsizeStatDisplay(self, ty, scale)
-    }
-}
-enum DisplayType {
-    Human,
-    K,
-    M,
-    G,
-    T,
-}
-enum Scale {
-    Metric,
-    Binary,
-}
-struct CompsizeStatDisplay<'a>(&'a CompsizeStat, DisplayType, Scale);
-impl<'a> Display for CompsizeStatDisplay<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            f,
-            "Processed {} files, {} regular extents ({} refs), {} inline.",
-            self.0.nfile, self.0.nextent, self.0.nref, self.0.ninline
-        )?;
-        todo!()
+    fn display(&self, scale: Scale) -> CompsizeStatDisplay<'_> {
+        CompsizeStatDisplay { stat: self, scale }
     }
 }
 
-// Processed 3356969 files, 653492 regular extents (2242077 refs), 2018321 inline.
-// Type       Perc     Disk Usage   Uncompressed Referenced
-// TOTAL       78%     100146085502 127182733170 481020538738
-// none       100%     88797796415  88797796415  364255758399
-// zstd        29%     11348289087  38384936755  116764780339
+struct CompsizeStatDisplay<'a> {
+    stat: &'a CompsizeStat,
+    scale: Scale,
+}
+impl<'a> Display for CompsizeStatDisplay<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { stat, scale } = self;
+        writeln!(
+            f,
+            "Processed {} files, {} regular extents ({} refs), {} inline.",
+            stat.nfile, stat.nextent, stat.nref, stat.ninline
+        )?;
+        // Processed 3356969 files, 653492 regular extents (2242077 refs), 2018321 inline.
+        // Type       Perc     Disk Usage   Uncompressed Referenced
+        // TOTAL       78%     100146085502 127182733170 481020538738
+        // none       100%     88797796415  88797796415  364255758399
+        // zstd        29%     11348289087  38384936755  116764780339
+        fn write_table(
+            f: &mut impl Write,
+            ty: impl Display,
+            percentage: impl Display,
+            disk_usage: impl Display,
+            uncomp_usage: impl Display,
+            refd_usage: impl Display,
+        ) -> std::fmt::Result {
+            writeln!(
+                f,
+                "{:10} {:8} {:12} {:12} {:12}",
+                ty, percentage, disk_usage, uncomp_usage, refd_usage
+            )
+        }
+        write_table(
+            f,
+            "Type",
+            "Perc",
+            "Disk Usage",
+            "Uncompressed",
+            "Referenced",
+        )?;
+        // total
+        {
+            let total_disk = stat.prealloc.disk + stat.stat.iter().map(|s| s.disk).sum::<u64>();
+            let total_uncomp =
+                stat.prealloc.uncomp + stat.stat.iter().map(|s| s.uncomp).sum::<u64>();
+            let total_refd = stat.prealloc.refd + stat.stat.iter().map(|s| s.refd).sum::<u64>();
+            let total_percentage = total_disk as f64 / total_uncomp as f64 * 100.0;
+            write_table(
+                f,
+                "TOTAL",
+                format_args!("{:3.0}%", total_percentage),
+                scale.scale(total_disk),
+                scale.scale(total_uncomp),
+                scale.scale(total_refd),
+            )?;
+        }
+        // normal
+        for (i, s0) in stat.stat.iter().enumerate() {
+            if s0.is_empty() {
+                continue;
+            }
+            write_table(
+                f,
+                btrfs::Compression::from_usize(i).name(),
+                format_args!("{:3.0}%", s0.get_percent()),
+                scale.scale(s0.disk),
+                scale.scale(s0.uncomp),
+                scale.scale(s0.refd),
+            )?;
+        }
+        // prealloc
+        if !stat.prealloc.is_empty() {
+            write_table(
+                f,
+                "Prealloc",
+                format_args!("{:3.0}%", stat.prealloc.get_percent()),
+                scale.scale(stat.prealloc.disk),
+                scale.scale(stat.prealloc.uncomp),
+                scale.scale(stat.prealloc.refd),
+            )?;
+        }
+        Ok(())
+    }
+}
 
 type WorkerRx = Receiver<DirEntry>;
 type WorkerTx = Sender<DirEntry>;
@@ -232,5 +293,14 @@ fn main() {
     if quit_sig.load(Ordering::Acquire) {
         process::exit(1);
     }
-    println!("{:#?}", final_stat);
+
+    println!("{}", extent_map.len());
+    if final_stat.nfile == 0 {
+        eprintln!("No files.");
+        exit(1);
+    } else if final_stat.nref == 0 {
+        eprintln!("All empty or still-delalloced files.");
+        exit(1);
+    }
+    println!("{}", final_stat.display(Scale::default()));
 }

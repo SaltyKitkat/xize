@@ -15,14 +15,6 @@ pub const BTRFS_FILE_EXTENT_INLINE: u8 = 0;
 pub const BTRFS_FILE_EXTENT_REG: u8 = 1;
 pub const BTRFS_FILE_EXTENT_PREALLOC: u8 = 2;
 
-// pub const struct_btrfs_ioctl_search_header = extern struct {
-//     transid: __u64 = @import("std").mem.zeroes(__u64),
-//     objectid: __u64 = @import("std").mem.zeroes(__u64),
-//     offset: __u64 = @import("std").mem.zeroes(__u64),
-//     type: __u32 = @import("std").mem.zeroes(__u32),
-//     len: __u32 = @import("std").mem.zeroes(__u32),
-// };
-
 // le on disk
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
@@ -46,18 +38,6 @@ impl IoctlSearchHeader {
     }
 }
 
-// const file_extent_item = packed struct {
-//     generation: u64,
-//     ram_bytes: u64,
-//     compression: u8,
-//     encryption: u8,
-//     other_encoding: u16,
-//     type: u8,
-//     disk_bytenr: u64,
-//     disk_num_bytes: u64,
-//     offset: u64,
-//     num_bytes: u64,
-// };
 // le on disk
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(packed)]
@@ -98,6 +78,7 @@ pub struct IoctlSearchItem {
     pub(self) header: IoctlSearchHeader,
     pub(self) item: FileExtentItem,
 }
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compression {
@@ -110,13 +91,21 @@ impl Compression {
     pub fn as_usize(self) -> usize {
         self as usize
     }
-    pub fn from_usize(n: u8) -> Self {
+    pub fn from_usize(n: usize) -> Self {
         match n {
             0 => Self::None,
             1 => Self::Zlib,
             2 => Self::Lzo,
             3 => Self::Zstd,
             _ => panic!("Invalid compression type: {}", n),
+        }
+    }
+    pub fn name(&self) -> &'static str {
+        match self {
+            Compression::None => "none",
+            Compression::Zlib => "zlib",
+            Compression::Lzo => "lzo",
+            Compression::Zstd => "zstd",
         }
     }
 }
@@ -167,7 +156,7 @@ impl IoctlSearchItem {
     pub fn parse(&self) -> Result<Option<(ExtentKey, Compression, ExtentStat)>, String> {
         let hlen = self.header.len;
         let ram_bytes = self.item.ram_bytes;
-        let comp_type = Compression::from_usize(self.item.compression);
+        let comp_type = Compression::from_usize(self.item.compression as _);
         let extent_type = ExtentType::from_u8(self.item.r#type);
         if extent_type == ExtentType::Inline {
             const EXTENT_INLINE_HEADER_SIZE: usize = 21;
@@ -212,28 +201,6 @@ impl IoctlSearchItem {
     }
 }
 
-// le on disk
-// #[repr(packed)]
-// pub struct FileExtentItem {
-//     header: FileExtentItemHeader,
-//     pub disk_bytenr: u64,
-//     pub disk_num_bytes: u64,
-//     pub offset: u64,
-//     pub num_bytes: u64,
-// }
-
-// sv2_args->key.tree_id = 0;
-// sv2_args->key.max_objectid = st_ino;
-// sv2_args->key.min_objectid = st_ino;
-// sv2_args->key.min_offset = 0;
-// sv2_args->key.max_offset = -1;
-// sv2_args->key.min_transid = 0;
-// sv2_args->key.max_transid = -1;
-// // Only search for EXTENT_DATA_KEY
-// sv2_args->key.min_type = BTRFS_EXTENT_DATA_KEY;
-// sv2_args->key.max_type = BTRFS_EXTENT_DATA_KEY;
-// sv2_args->key.nr_items = -1;
-// sv2_args->buf_size = sizeof(sv2_args->buf);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct IoctlSearchKey {

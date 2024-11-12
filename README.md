@@ -1,4 +1,6 @@
 - compsize RIIR version
 - use multithreads to speed up
 - ignore instead of exit if search_v2 is not supported
-- todo: impl -x to check device info
+- todo
+  - impl -x to check device info
+  - worker thread_local cache for extent map
